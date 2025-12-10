@@ -9,9 +9,11 @@ import torch
 import json
 import os
 import re
+import math
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 BASE_DIR = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(BASE_DIR, "saved_model")
@@ -32,102 +34,138 @@ app.add_middleware(
 # ===============================
 print("Loading model and tokenizer...")
 
-# Load config
-with open(os.path.join(MODEL_PATH, "config.json"), encoding="utf-8") as f:
-    model_config = json.load(f)
+MODEL_LOADED = False
+model = None
+tokenizer = None
 
-# Load vocab
-with open(os.path.join(MODEL_PATH, "vocab.txt"), encoding="utf-8") as f:
-    vocab = [line.strip() for line in f]
-
-
-class SimpleTokenizer:
-    def __init__(self, vocab_list):
-        self.vocab = {word: idx for idx, word in enumerate(vocab_list)}
-        # Special tokens
-        self.vocab['[CLS]'] = 101
-        self.vocab['[SEP]'] = 102
-        self.vocab['[PAD]'] = 0
-        self.vocab['[UNK]'] = 100
-        self.max_length = 512
-
-    def tokenize(self, text):
-        """Simple whitespace tokenization"""
-        words = text.lower().split()
-        tokens = ['[CLS]']
-        for word in words:
-            clean_word = word.strip('.,!?;:')
-            if clean_word in self.vocab:
-                tokens.append(clean_word)
-            else:
-                tokens.append('[UNK]')
-        tokens.append('[SEP]')
-        # truncate
-        return tokens[:self.max_length]
-
-    def encode(self, text):
-        """Convert text to token IDs"""
-        tokens = self.tokenize(text)
-        ids = [self.vocab.get(token, self.vocab['[UNK]']) for token in tokens]
-        padding = [self.vocab['[PAD]']] * (self.max_length - len(ids))
-        return ids + padding
-
-    def __call__(self, text, return_tensors=None, padding=None, truncation=None, max_length=None):
-        ids = self.encode(text)
-        if return_tensors == "pt":
-            input_ids = torch.tensor([ids])
-            attention_mask = torch.tensor([[1 if i != self.vocab['[PAD]'] else 0 for i in ids]])
-            return {"input_ids": input_ids, "attention_mask": attention_mask}
-        return {"input_ids": [ids]}
-
-
-tokenizer = SimpleTokenizer(vocab)
-
-# Load model weights from safetensors
 try:
+    # Load only the tokenizer from the minimal AutoTokenizer without full transformers  
+    from tokenizers import Tokenizer as TokenizersTokenizer
+    
+    tokenizer_path = os.path.join(MODEL_PATH, "tokenizer.json")
+    tokenizer = TokenizersTokenizer.from_file(tokenizer_path)
+    
+    # Load model weights using safetensors + torch only (no transformers needed)
     from safetensors.torch import load_file
-    model_weights = load_file(os.path.join(MODEL_PATH, "model.safetensors"))
-    print("✅ Model loaded from safetensors")
-except ImportError:
-    print("⚠️ safetensors not available, using fallback mode")
-    model_weights = None
-
-
-class SimpleSequenceClassifier(torch.nn.Module):
-    def __init__(self, vocab_size=30522, num_labels=4):
-        super().__init__()
-        self.embeddings = torch.nn.Embedding(vocab_size, 768)
-        self.dropout = torch.nn.Dropout(0.1)
-        self.classifier = torch.nn.Linear(768, num_labels)
-
-    def forward(self, input_ids, attention_mask=None, **kwargs):
-        embedded = self.embeddings(input_ids)
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).expand(embedded.size()).float()
-            pooled = (embedded * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        else:
-            pooled = embedded.mean(1)
-        pooled = self.dropout(pooled)
-        logits = self.classifier(pooled)
-        return type("Output", (), {"logits": logits})()
-
-
-model = SimpleSequenceClassifier()
-
-if model_weights is not None:
-    try:
-        model.load_state_dict(model_weights)
-        print("✅ Model weights loaded successfully")
-    except Exception as e:
-        print(f"⚠️ Could not load weights: {e}")
-
-model.eval()
+    
+    model_path = os.path.join(MODEL_PATH, "model.safetensors")
+    state_dict = load_file(model_path)
+    
+    # Load config to understand model structure
+    import json
+    config_path = os.path.join(MODEL_PATH, "config.json")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    # Create a DistilBERT model wrapper that runs actual transformer inference
+    class DistilBertModel:
+        def __init__(self, state_dict, config):
+            self.state_dict = state_dict
+            self.config = config
+            self.device = torch.device("cpu")
+            self.is_loaded = True
+            self.vocab_size = config.get('vocab_size', 30522)
+            self.hidden_dim = config.get('dim', 768)
+            self.num_labels = 2  # Binary classification: clickbait vs non-clickbait
+            self.n_layers = config.get('n_layers', 6)
+            self.n_heads = config.get('n_heads', 12)
+            self.head_dim = self.hidden_dim // self.n_heads
+            
+        def gelu(self, x):
+            """GELU activation"""
+            return 0.5 * x * (1 + torch.tanh(math.sqrt(2/math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+        
+        def predict(self, input_ids, attention_mask):
+            """Full DistilBERT forward pass through all 6 transformer layers"""
+            with torch.no_grad():
+                batch_size, seq_length = input_ids.shape
+                
+                # 1. Embeddings
+                word_embeddings = self.state_dict.get('distilbert.embeddings.word_embeddings.weight')
+                position_embeddings = self.state_dict.get('distilbert.embeddings.position_embeddings.weight')
+                embed_ln_weight = self.state_dict.get('distilbert.embeddings.LayerNorm.weight')
+                embed_ln_bias = self.state_dict.get('distilbert.embeddings.LayerNorm.bias')
+                
+                hidden_states = torch.nn.functional.embedding(input_ids, word_embeddings)
+                position_ids = torch.arange(seq_length, dtype=torch.long, device=self.device).unsqueeze(0)
+                hidden_states = hidden_states + torch.nn.functional.embedding(position_ids, position_embeddings)
+                hidden_states = torch.nn.functional.layer_norm(hidden_states, (self.hidden_dim,), embed_ln_weight, embed_ln_bias)
+                
+                # 2. Transformer layers
+                for layer_idx in range(self.n_layers):
+                    # Self-attention
+                    q_w = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.q_lin.weight']
+                    q_b = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.q_lin.bias']
+                    k_w = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.k_lin.weight']
+                    k_b = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.k_lin.bias']
+                    v_w = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.v_lin.weight']
+                    v_b = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.v_lin.bias']
+                    out_w = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.out_lin.weight']
+                    out_b = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.attention.out_lin.bias']
+                    
+                    Q = torch.nn.functional.linear(hidden_states, q_w, q_b)
+                    K = torch.nn.functional.linear(hidden_states, k_w, k_b)
+                    V = torch.nn.functional.linear(hidden_states, v_w, v_b)
+                    
+                    Q = Q.view(batch_size, seq_length, self.n_heads, self.head_dim).transpose(1, 2)
+                    K = K.view(batch_size, seq_length, self.n_heads, self.head_dim).transpose(1, 2)
+                    V = V.view(batch_size, seq_length, self.n_heads, self.head_dim).transpose(1, 2)
+                    
+                    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                    if attention_mask is not None:
+                        mask = (attention_mask.unsqueeze(1).unsqueeze(2) == 1)
+                        scores = scores.masked_fill(~mask, float('-inf'))
+                    
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    context = torch.matmul(attn_weights, V)
+                    context = context.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_dim)
+                    attn_output = torch.nn.functional.linear(context, out_w, out_b)
+                    
+                    # Feed-forward
+                    ffn_w1 = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.ffn.lin1.weight']
+                    ffn_b1 = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.ffn.lin1.bias']
+                    ffn_w2 = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.ffn.lin2.weight']
+                    ffn_b2 = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.ffn.lin2.bias']
+                    
+                    ffn = torch.nn.functional.linear(attn_output, ffn_w1, ffn_b1)
+                    ffn = self.gelu(ffn)
+                    ffn = torch.nn.functional.linear(ffn, ffn_w2, ffn_b2)
+                    
+                    # Layer norm
+                    ln_w = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.output_layer_norm.weight']
+                    ln_b = self.state_dict[f'distilbert.transformer.layer.{layer_idx}.output_layer_norm.bias']
+                    hidden_states = torch.nn.functional.layer_norm(attn_output + ffn, (self.hidden_dim,), ln_w, ln_b)
+                
+                # 3. Classification head - use [CLS] token
+                cls_output = hidden_states[:, 0, :]
+                pre_clf_w = self.state_dict['pre_classifier.weight']
+                pre_clf_b = self.state_dict['pre_classifier.bias']
+                clf_feat = torch.nn.functional.linear(cls_output, pre_clf_w, pre_clf_b)
+                clf_feat = torch.relu(clf_feat)
+                
+                clf_w = self.state_dict['classifier.weight']
+                clf_b = self.state_dict['classifier.bias']
+                logits = torch.nn.functional.linear(clf_feat, clf_w, clf_b)
+                
+                return logits
+    
+    model = DistilBertModel(state_dict, config)
+    
+    print("[OK] Model weights loaded successfully from saved_model/")
+    print(f"    Running DistilBERT with {model.n_layers} transformer layers")
+    print(f"    Binary classification: Clickbait vs Non-clickbait")
+    MODEL_LOADED = True
+except Exception as e:
+    print(f"[ERROR] Could not load model: {e}")
+    import traceback
+    traceback.print_exc()
+    MODEL_LOADED = False
+    model = None
+    tokenizer = None
 
 LABEL_MAP = {
-    0: "Listicle",
-    1: "Sensational",
-    2: "Question",
-    3: "Teaser",
+    0: "Not clickbait",
+    1: "Clickbait",
 }
 
 # ===============================
@@ -181,11 +219,22 @@ def get_sentiment(text: str):
 # PREDICTION LOGIC
 # ===============================
 def predict_text(text: str):
-    inputs = tokenizer(text, return_tensors="pt")
+    if not MODEL_LOADED or model is None or tokenizer is None:
+        raise ValueError("Model not loaded. Check server logs.")
+    
+    # Tokenize using the tokenizer (max_length is set in tokenizer config)
+    encoding = tokenizer.encode(text)
+    input_ids = encoding.ids
+    attention_mask = encoding.attention_mask
+    
+    # Convert to torch tensors
+    input_ids_tensor = torch.tensor([input_ids], dtype=torch.long)
+    attention_mask_tensor = torch.tensor([attention_mask], dtype=torch.long)
+    
     with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits
-
+        # Use our simple model wrapper
+        logits = model.predict(input_ids_tensor, attention_mask_tensor)
+    
     probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
     pred_id = int(np.argmax(probs))
     confidence = float(probs[pred_id])
@@ -232,13 +281,10 @@ def predict_batch(file: UploadFile = File(...)):
 
 @app.get("/api/model_status")
 def model_status():
-    weights_present = model_weights is not None
     return {
         "model_file": os.path.join(MODEL_PATH, "model.safetensors"),
-        "weights_loaded": bool(weights_present),
-        "note": "Model weights loaded and ready"
-        if weights_present
-        else "Model weights not loaded; running in fallback mode",
+        "weights_loaded": MODEL_LOADED,
+        "note": "BERT model loaded and ready" if MODEL_LOADED else "Model loading failed - check server logs",
     }
 
 
@@ -257,4 +303,5 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
